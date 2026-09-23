@@ -8,6 +8,7 @@
 typedef uint8_t  byte;
 typedef float  f32;
 typedef double f64;
+typedef int32_t i32;
 
 
 // cc src/main.c -o mlp -O3 -march=native -funroll-loops
@@ -321,6 +322,74 @@ void MLP_Backward(MLP* model, int token_id, int y, GradState* grad_state) {
 }
 
 
+typedef struct Dataset {
+    char *Blob;
+    i32 *Offsets; // pointer ofsets, Offsets[i] = start of string i in Blob
+    i32 TotalLen;
+    i32 StringsCount;
+    i32 MaxLen;
+    i32 MinLen;
+    i32 AvgLen;
+} Dataset;
+
+Dataset* DatasetLoad(MemoryArena* a, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        int err = errno;
+        fprintf(stderr, "fopen failed: %s (errno=%d)\n", strerror(err), err);
+        abort();
+    }
+    
+    char line[64];
+    int count = 0;
+    int total_len = 0;
+    int max_len = 0;
+    int min_len = INT_MAX;
+    
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strcspn(line, "\n");
+        count++;
+        total_len += (int)len;
+        if ((int)len > max_len) max_len = (int)len;
+        if ((int)len < min_len) min_len = (int)len;
+    }
+    
+    if (count == 0) {
+        fclose(f);
+        fprintf(stderr, "empty file?\n");
+        abort();
+    }
+    rewind(f);
+    
+    Dataset* ds = ArenaPush(a, sizeof(Dataset));
+    ds->Offsets = ArenaPush(a, sizeof(i32) * count);
+    ds->Blob = ArenaPush(a, total_len + count);  // +count for nul terminators
+    
+    ds->StringsCount = count;
+    ds->TotalLen = total_len + count;
+    ds->MaxLen = max_len;
+    ds->MinLen = min_len;
+    ds->AvgLen = total_len / count;
+    
+    char* current_string = ds->Blob;
+    int i = 0;
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strcspn(line, "\n");
+        ds->Offsets[i] = (i32)(current_string - ds->Blob);
+        memcpy(current_string, line, len);
+        current_string[len] = '\0';
+        current_string += len + 1;
+        i++;
+    }
+
+    printf("loaded dataset %s. total entries: %d, minlen: %d maxlen: %d avg_len: %d total_len: %d\n", 
+        path,
+        count, min_len, max_len, ds->AvgLen, total_len);
+    
+    fclose(f);
+    return ds;
+}
+
 
 int main(int argc, char *argv[]) {
     srand((uint32_t)123);
@@ -335,7 +404,9 @@ int main(int argc, char *argv[]) {
     const int seq_len    =  1; 
     f64 expected_loss = -log(1/(f64)vocab_size);
     MLP* model = MLP_Create(main_arena, vocab_size, seq_len, n_embed, hidden_dim);
-    GradState* grad_state = GradStateCreate(main_arena, model);
+    ArenaLog(main_arena);
+     GradState* grad_state = GradStateCreate(main_arena, model);
+    ArenaLog(main_arena);
 
     #define NUM_W 3
     Matrix* m_params[NUM_W] = {model->E, model->W1, model->W2};
@@ -344,6 +415,11 @@ int main(int argc, char *argv[]) {
     #define NUM_B 2
     Vector* v_params[NUM_B] = {model->b1, model->b2};
     Vector* v_grads[NUM_B] = {grad_state->Grad_b1, grad_state->Grad_b2};
+
+    Dataset* ds = DatasetLoad(main_arena, "names.txt");
+    char* sample = ds->Blob + ds->Offsets[0];
+    printf("example string: %s\n", sample);
+    ArenaLog(main_arena);
 
     for (int step = 0; step < 10; step++) {
         int token_id = 0;
