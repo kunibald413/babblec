@@ -328,7 +328,7 @@ int main(int argc, char *argv[]) {
     MemoryArena* main_arena = ArenaCreate((size_t)(10 << 20));
     ArenaLog(main_arena);
 
-    f64 lr = 1.0;
+    f64 lr = 0.1;
     const int vocab_size = 27;
     const int hidden_dim = 64;
     const int n_embed    = 16;
@@ -337,17 +337,36 @@ int main(int argc, char *argv[]) {
     MLP* model = MLP_Create(main_arena, vocab_size, seq_len, n_embed, hidden_dim);
     GradState* grad_state = GradStateCreate(main_arena, model);
 
+    #define NUM_W 3
+    Matrix* m_params[NUM_W] = {model->E, model->W1, model->W2};
+    Matrix* m_grads[NUM_W] = {grad_state->Grad_E, grad_state->Grad_W1, grad_state->Grad_W2};
+
+    #define NUM_B 2
+    Vector* v_params[NUM_B] = {model->b1, model->b2};
+    Vector* v_grads[NUM_B] = {grad_state->Grad_b1, grad_state->Grad_b2};
+
     for (int step = 0; step < 10; step++) {
         int token_id = 0;
         int y = 1;
         MLP_Forward(model, token_id, y, grad_state);
         MLP_Backward(model, token_id, y, grad_state);
-    
-        // TODO sgd
-        // TODO zero grad
-        for (int i = 0; i < model->W2->Cols * model->W2->Rows; i ++) {
-            model->W2->Data[i] += -lr * grad_state->Grad_W2->Data[i];
-            grad_state->Grad_W2->Data[i] = 0.0;
+
+        // gd
+        for (int mi = 0; mi < NUM_B; mi ++){
+            Matrix* m = m_params[mi];
+            Matrix* g = m_grads[mi];
+            for (int i = 0; i < m->Cols * m->Rows; i ++) {
+                m->Data[i] += -lr * g->Data[i];
+                g->Data[i] = 0.0;
+            }
+        }
+        for (int vi = 0; vi < NUM_B; vi ++){
+            Vector* v = v_params[vi];
+            Vector* g = v_grads[vi];
+            for (int i = 0; i < v->Length; i ++) {
+                v->Data[i] += -lr * g->Data[i];
+                g->Data[i] = 0.0;
+            }
         }
     }
     
