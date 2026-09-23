@@ -133,10 +133,10 @@ Vector* VectorCreate(MemoryArena* a, int length) {
 
 MLP* MLP_Create(MemoryArena* a, int vocab_size, int context_length, int n_embed, int hidden_dim) {
     MLP* mlp = ArenaPush(a, sizeof(MLP));
-    mlp->E = MatrixCreate(a, vocab_size, n_embed, 0.01);
-    mlp->W1 = MatrixCreate(a, hidden_dim, n_embed * context_length, 0.01);
+    mlp->E = MatrixCreate(a, vocab_size, n_embed, 0.1);
+    mlp->W1 = MatrixCreate(a, hidden_dim, n_embed * context_length, 0.1);
     mlp->b1 = VectorCreate(a, hidden_dim);
-    mlp->W2 = MatrixCreate(a, vocab_size, hidden_dim, 0.01);
+    mlp->W2 = MatrixCreate(a, vocab_size, hidden_dim, 0.1);
     mlp->b2 = VectorCreate(a, vocab_size);
     return mlp;
 }
@@ -328,18 +328,28 @@ int main(int argc, char *argv[]) {
     MemoryArena* main_arena = ArenaCreate((size_t)(10 << 20));
     ArenaLog(main_arena);
 
+    f64 lr = 1.0;
     const int vocab_size = 27;
+    const int hidden_dim = 64;
+    const int n_embed    = 16;
+    const int seq_len    =  1; 
     f64 expected_loss = -log(1/(f64)vocab_size);
-    MLP* model = MLP_Create(main_arena, vocab_size, 1, 16, 64);
+    MLP* model = MLP_Create(main_arena, vocab_size, seq_len, n_embed, hidden_dim);
     GradState* grad_state = GradStateCreate(main_arena, model);
 
-    int token_id = 0;
-    int y = 1;
-    MLP_Forward(model, token_id, y, grad_state);
-    MLP_Backward(model, token_id, y, grad_state);
-
-    // TODO sgd
-    // TODO zero grad
+    for (int step = 0; step < 10; step++) {
+        int token_id = 0;
+        int y = 1;
+        MLP_Forward(model, token_id, y, grad_state);
+        MLP_Backward(model, token_id, y, grad_state);
+    
+        // TODO sgd
+        // TODO zero grad
+        for (int i = 0; i < model->W2->Cols * model->W2->Rows; i ++) {
+            model->W2->Data[i] += -lr * grad_state->Grad_W2->Data[i];
+            grad_state->Grad_W2->Data[i] = 0.0;
+        }
+    }
     
     ArenaLog(main_arena);
     
