@@ -346,7 +346,7 @@ Dataset* DatasetLoad(MemoryArena* a, const char* path) {
     int max_len = 0;
     int min_len = INT_MAX;
     
-    while (fgets(line, sizeof line, f)) {
+    while (fgets(line, sizeof(line), f)) {
         size_t len = strcspn(line, "\n");
         count++;
         total_len += (int)len;
@@ -420,7 +420,7 @@ int main(int argc, char *argv[]) {
     char* sample = ds->Blob + ds->Offsets[0];
     printf("example string: %s\n", sample);
     ArenaLog(main_arena);
-
+    
     for (int step = 0; step < 10; step++) {
         int token_id = 0;
         int y = 1;
@@ -428,7 +428,7 @@ int main(int argc, char *argv[]) {
         MLP_Backward(model, token_id, y, grad_state);
 
         // gd
-        for (int mi = 0; mi < NUM_B; mi ++){
+        for (int mi = 0; mi < NUM_W; mi ++){
             Matrix* m = m_params[mi];
             Matrix* g = m_grads[mi];
             for (int i = 0; i < m->Cols * m->Rows; i ++) {
