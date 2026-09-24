@@ -109,6 +109,28 @@ f64 RndF64() {
 }
 
 
+typedef struct ActivationStats {
+    Vector* Sum; // sum of A[i] over all foward passes
+    Vector* ZeroCount; // count of A[i] == 0
+    int ActivationsTotal; // forward pass count
+} ActivationStats;
+
+void PrintActivationStats(ActivationStats* s) {
+    if (s->ActivationsTotal == 0) return;
+    int n = s->Sum->Length;
+    printf("--- activation stats over %d forwards ---\n", s->ActivationsTotal);
+    int dead = 0;
+    for (int i = 0; i < n; i++) {
+        f64 mean      = s->Sum->Data[i] / s->ActivationsTotal;
+        f64 zero_frac = s->ZeroCount->Data[i] / s->ActivationsTotal;
+        if (zero_frac > 0.99) dead++;
+        printf("neuron %2d: mean=%8.4f zero_frac=%.3f%s\n",
+               i, mean, zero_frac, zero_frac > 0.99 ? "  <-- DEAD" : "");
+    }
+    printf("dead neurons: %d / %d\n", dead, n);
+}
+
+
 Matrix* MatrixCreate(MemoryArena* a, int rows, int cols, f64 init_scale) {
     Matrix* m = ArenaPush(a, sizeof(Matrix));
     m->Data = ArenaPush(a, sizeof(f64) * rows * cols);
@@ -157,7 +179,7 @@ GradState* GradStateCreate(MemoryArena* a, MLP* model) {
     return s;
 }
 
-f64 MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state) {
+f64 MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state, ActivationStats* act_stats) {
     assert(token_idx >= 0 && token_idx < m->E->Rows && "invalid index");
 
     // embed
@@ -180,6 +202,16 @@ f64 MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state) {
     f64* A = grad_state->A->Data;
     for (int i = 0; i < m->W1->Rows; i++) {
         A[i] = x_hidden[i] > 0.0 ? x_hidden[i] : 0.0;  // ReLU
+    }
+
+    if (act_stats != NULL) {
+        assert(act_stats->Sum->Length == grad_state->A->Length && "stats and activations mismatch");
+        for (int i = 0; i < grad_state->A->Length; i++) {
+            f64 v = A[i];
+            act_stats->Sum->Data[i] += v;
+            if (v == 0.0) act_stats->ZeroCount->Data[i]++;
+        }
+        act_stats->ActivationsTotal++;
     }
 
     assert(m->W1->Rows == m->W2->Cols && "shape mismatch! W1 rows mustbe same as W2 cols");
@@ -475,7 +507,7 @@ f64 EvalLoss(
         for (int i = 0; i <= len; i++) {
             byte xc = (i == 0)   ? EOS : (byte)word[i - 1];
             byte yc = (i == len) ? EOS : (byte)word[i];
-            total += MLP_Forward(model, stoi[xc], stoi[yc], gs);
+            total += MLP_Forward(model, stoi[xc], stoi[yc], gs, NULL);
             tokens++;
         }
     }
@@ -488,7 +520,7 @@ void SampleNames(MLP* model, GradState* gs, int n) {
         int tok = stoi[EOS];
         printf("  ");
         for (int i = 0; i < 30; i++) {
-            MLP_Forward(model, tok, unused_y, gs);
+            MLP_Forward(model, tok, unused_y, gs, NULL);
             f64 r = RndF64();
             f64 cdf = 0.0;
             int next = 0;
@@ -528,7 +560,7 @@ int main(int argc, char *argv[]) {
         rryra
     */
 
-    f64 lr = 0.02;
+    f64 lr = 0.01;
     const int vocab_size = 27;
     const int hidden_dim = 64;
     const int n_embed    = 16;
@@ -536,8 +568,13 @@ int main(int argc, char *argv[]) {
     f64 expected_loss = -log(1/(f64)vocab_size);
     MLP* model = MLP_Create(main_arena, vocab_size, seq_len, n_embed, hidden_dim);
     ArenaLog(main_arena);
-     GradState* grad_state = GradStateCreate(main_arena, model);
+    GradState* grad_state = GradStateCreate(main_arena, model);
     ArenaLog(main_arena);
+
+    ActivationStats act_stats;
+    act_stats.Sum = VectorCreate(main_arena, model->W1->Rows);
+    act_stats.ZeroCount = VectorCreate(main_arena, model->W1->Rows);
+    act_stats.ActivationsTotal = 0;
 
     #define NUM_W 3
     Matrix* m_params[NUM_W] = {model->E, model->W1, model->W2};
@@ -574,7 +611,7 @@ int main(int argc, char *argv[]) {
             int token_id = stoi[x_char];
             int y = stoi[y_char];
 
-            f64 loss = MLP_Forward(model, token_id, y, grad_state);
+            f64 loss = MLP_Forward(model, token_id, y, grad_state, &act_stats);
 
             if (step < 20 || step % 1000 == 0 || step == max_train_steps -1) {
                 printf("step: %d x: '%c' y: '%c' loss: %.3f\n",
@@ -619,6 +656,7 @@ int main(int argc, char *argv[]) {
     printf("final train loss: %.4f\n", train_loss);
     printf("final test  loss: %.4f\n", test_loss);
 
+    PrintActivationStats(&act_stats);
 
     printf("samples:\n");
     SampleNames(model, grad_state, 20);
