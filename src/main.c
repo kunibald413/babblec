@@ -157,7 +157,7 @@ GradState* GradStateCreate(MemoryArena* a, MLP* model) {
     return s;
 }
 
-void MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state) {
+f64 MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state) {
     assert(token_idx >= 0 && token_idx < m->E->Rows && "invalid index");
 
     // embed
@@ -210,7 +210,7 @@ void MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state) {
     }
     
     f64 loss = -log(probs[y]);
-    printf("loss: %.3f\n", loss);
+    return loss;
 }
 
 void MLP_Backward(MLP* model, int token_id, int y, GradState* grad_state) {
@@ -322,6 +322,7 @@ void MLP_Backward(MLP* model, int token_id, int y, GradState* grad_state) {
 }
 
 
+// c is a joy
 typedef struct Dataset {
     char *Blob;
     i32 *Offsets; // pointer ofsets, Offsets[i] = start of string i in Blob
@@ -390,6 +391,76 @@ Dataset* DatasetLoad(MemoryArena* a, const char* path) {
     return ds;
 }
 
+char* DatasetGetStr(Dataset *ds, int idx) {
+    if (idx < 0 || idx >= ds->StringsCount) {
+        fprintf(stderr, "DatasetGetStr idx out of range %d\n", idx);
+        abort();
+    }
+    return ds->Blob + ds->Offsets[idx];
+}
+
+typedef struct Split {
+    i32* TrainIndices;
+    i32 TrainCount;
+    i32* TestIndicies;
+    i32 TestCount;
+} Split;
+
+static void Shuffle(i32* arr, int length) {
+    for (int i = length - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        i32 temp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = temp;
+    }
+}
+
+Split CreateSplit(MemoryArena* a, Dataset* ds, f64 test_fraction) {
+    assert(test_fraction >= 0.0 && test_fraction < 1.0 && "invalid value for test fraction");
+    int count = ds->StringsCount;
+
+    i32* all = ArenaPush(a, sizeof(i32) * count);
+    for (int i = 0; i < count; i++) all[i] = i;
+    Shuffle(all, count);
+
+    int test_count = (int)(count * test_fraction);
+    if (test_count > 1000) test_count = 1000;
+    if (test_count < 1) test_count = 1;
+    int train_count = count - test_count;
+
+    Split s;
+    s.TrainIndices = all;
+    s.TrainCount = train_count;
+    s.TestIndicies = all + train_count;
+    s.TestCount = test_count;
+
+    return s;
+}
+
+char* GetTrainSample(Dataset* ds, Split* split, int i) {
+    return DatasetGetStr(ds, split->TrainIndices[i]);
+}
+char* GetTestSample(Dataset* ds, Split* split, int i) {
+    return DatasetGetStr(ds, split->TestIndicies[i]);
+}
+
+#define VOCAB_SIZE 27
+
+byte stoi[256];
+char itos[VOCAB_SIZE];
+const byte EOS = '.';
+
+static void BuildVocab(Dataset* ds) {
+    memset(stoi, 0, sizeof(stoi));
+    // token 0 is '.' (BOS + EOS)
+    stoi[(byte)EOS] = 0;
+    itos[0] = EOS;
+    // 1..26 = 'a'..'z'
+    for (int i = 0; i < 26; i++) {
+        stoi[(byte)('a' + i)] = (byte)(i + 1);
+        itos[i + 1]           = (char)('a' + i);
+    }
+}
 
 int main(int argc, char *argv[]) {
     srand((uint32_t)123);
@@ -420,30 +491,57 @@ int main(int argc, char *argv[]) {
     char* sample = ds->Blob + ds->Offsets[0];
     printf("example string: %s\n", sample);
     ArenaLog(main_arena);
-    
-    for (int step = 0; step < 10; step++) {
-        int token_id = 0;
-        int y = 1;
-        MLP_Forward(model, token_id, y, grad_state);
-        MLP_Backward(model, token_id, y, grad_state);
 
-        // gd
-        for (int mi = 0; mi < NUM_W; mi ++){
-            Matrix* m = m_params[mi];
-            Matrix* g = m_grads[mi];
-            for (int i = 0; i < m->Cols * m->Rows; i ++) {
-                m->Data[i] += -lr * g->Data[i];
-                g->Data[i] = 0.0;
+    BuildVocab(ds);
+
+    Split split = CreateSplit(main_arena, ds, 0.1);
+    
+    const int max_train_steps = 32000;
+
+    for (int step = 0; step < max_train_steps; step++) {
+        const char* s = DatasetGetStr(ds, step % ds->StringsCount);
+        int sample_idx = rand() % split.TrainCount;
+        const char* sample = GetTrainSample(ds, &split, sample_idx);
+        int sample_len = (int)strlen(sample);
+        // printf("step %d picked sample: %s len: %d\n", step, sample, sample_len);
+
+        // '.emma.'
+        for (int i = 0; i <= sample_len; i ++) {
+            byte x_char = i == 0 ? EOS : (byte)sample[i - 1];
+            byte y_char = i == sample_len ? EOS : (byte)sample[i];
+
+            int token_id = stoi[x_char];
+            int y = stoi[y_char];
+
+            f64 loss = MLP_Forward(model, token_id, y, grad_state);
+
+            if (step < 20 || step % 1000 == 0 || step == max_train_steps -1) {
+                printf("step: %d x: '%c' y: '%c' loss: %.3f\n",
+                     step, (char)x_char, (char)y_char, loss);
             }
-        }
-        for (int vi = 0; vi < NUM_B; vi ++){
-            Vector* v = v_params[vi];
-            Vector* g = v_grads[vi];
-            for (int i = 0; i < v->Length; i ++) {
-                v->Data[i] += -lr * g->Data[i];
-                g->Data[i] = 0.0;
+    
+            MLP_Backward(model, token_id, y, grad_state);
+    
+            // gd
+            for (int mi = 0; mi < NUM_W; mi ++){
+                Matrix* m = m_params[mi];
+                Matrix* g = m_grads[mi];
+                for (int i = 0; i < m->Cols * m->Rows; i ++) {
+                    m->Data[i] += -lr * g->Data[i];
+                    g->Data[i] = 0.0;
+                }
             }
+            for (int vi = 0; vi < NUM_B; vi ++){
+                Vector* v = v_params[vi];
+                Vector* g = v_grads[vi];
+                for (int i = 0; i < v->Length; i ++) {
+                    v->Data[i] += -lr * g->Data[i];
+                    g->Data[i] = 0.0;
+                }
+            }
+
         }
+        //lr = (lr * ((f64)1 - (f64)step/(f64)max_train_steps)) + 0.00000001;
     }
     
     ArenaLog(main_arena);
