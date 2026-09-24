@@ -462,13 +462,73 @@ static void BuildVocab(Dataset* ds) {
     }
 }
 
+
+f64 EvalLoss(
+    MLP* model, GradState* gs,
+    Dataset* ds, Split* split,
+    int* indices, int count) {
+    f64 total = 0.0;
+    int tokens = 0;
+    for (int w = 0; w < count; w++) {
+        const char* word = DatasetGetStr(ds, indices[w]);
+        int len = (int)strlen(word);
+        for (int i = 0; i <= len; i++) {
+            byte xc = (i == 0)   ? EOS : (byte)word[i - 1];
+            byte yc = (i == len) ? EOS : (byte)word[i];
+            total += MLP_Forward(model, stoi[xc], stoi[yc], gs);
+            tokens++;
+        }
+    }
+    return total / (f64)tokens;
+}
+
+void SampleNames(MLP* model, GradState* gs, int n) {
+    int unused_y = 0;
+    for (int k = 0; k < n; k++) {
+        int tok = stoi[EOS];
+        printf("  ");
+        for (int i = 0; i < 30; i++) {
+            MLP_Forward(model, tok, unused_y, gs);
+            f64 r = RndF64();
+            f64 cdf = 0.0;
+            int next = 0;
+            for (int j = 0; j < VOCAB_SIZE; j++) {
+                cdf += gs->Probs->Data[j];
+                if (r <= cdf) { next = j; break; }
+            }
+            if (next == stoi[EOS]) break;
+            putchar(itos[next]);
+            tok = next;
+        }
+        putchar('\n');
+    }
+}
+
 int main(int argc, char *argv[]) {
     srand((uint32_t)123);
 
     MemoryArena* main_arena = ArenaCreate((size_t)(10 << 20));
     ArenaLog(main_arena);
 
-    f64 lr = 0.1;
+    /* 
+    
+    train: steps=320000 lr=0.020 vocab=27 hidden=64 n_embed=16 seq_len=1
+    final train loss: 2.4691
+    final test  loss: 2.4647
+    samples:
+        malbronkaman
+        caiyzaleli
+        kerdieraet
+        shisieey
+        maeeleker
+        kowevkamulafi
+        fo
+        kabeitt
+        ta
+        rryra
+    */
+
+    f64 lr = 0.02;
     const int vocab_size = 27;
     const int hidden_dim = 64;
     const int n_embed    = 16;
@@ -496,14 +556,15 @@ int main(int argc, char *argv[]) {
 
     Split split = CreateSplit(main_arena, ds, 0.1);
     
-    const int max_train_steps = 32000;
+    const int max_train_steps = 320000;
 
     for (int step = 0; step < max_train_steps; step++) {
-        const char* s = DatasetGetStr(ds, step % ds->StringsCount);
+        //const char* s = DatasetGetStr(ds, step % ds->StringsCount);
+        // printf("step %d picked sample: %s len: %d\n", step, sample, sample_len);
+
         int sample_idx = rand() % split.TrainCount;
         const char* sample = GetTrainSample(ds, &split, sample_idx);
         int sample_len = (int)strlen(sample);
-        // printf("step %d picked sample: %s len: %d\n", step, sample, sample_len);
 
         // '.emma.'
         for (int i = 0; i <= sample_len; i ++) {
@@ -549,13 +610,27 @@ int main(int argc, char *argv[]) {
     printf("expected rnd init loss: %.4f\n", expected_loss);
     printf("size of MLP: %zu\n", sizeof(MLP));
 
+    printf("train: steps=%d lr=%.3f vocab=%d hidden=%d n_embed=%d seq_len=%d\n",
+       max_train_steps, lr, vocab_size, hidden_dim, n_embed, seq_len);
+    f64 train_loss = EvalLoss(model, grad_state, ds, &split,
+                          split.TrainIndices, split.TrainCount);
+    f64 test_loss  = EvalLoss(model, grad_state, ds, &split,
+                            split.TestIndicies, split.TestCount);
+    printf("final train loss: %.4f\n", train_loss);
+    printf("final test  loss: %.4f\n", test_loss);
 
+
+    printf("samples:\n");
+    SampleNames(model, grad_state, 10);
+
+    #if 0
     f64 logits[4] = {-0.02, -0.01, 0.01, 0.02};
     for (int i = 0; i < 4; i++) {
         f64 exp1 = exp(logits[i]);
         f64 loss1 = -log(exp1);
         printf("logit: %.4f exp %.4f: loss: %.4f\n", logits[i], exp1, loss1);
     }
+    #endif
 
     return 0;
 }
