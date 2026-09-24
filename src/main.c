@@ -602,7 +602,7 @@ int main(int argc, char *argv[]) {
             }
 
         }
-        //lr = (lr * ((f64)1 - (f64)step/(f64)max_train_steps)) + 0.00000001;
+        lr = step < 100000 ? 0.02 : 0.001;
     }
     
     ArenaLog(main_arena);
@@ -621,7 +621,7 @@ int main(int argc, char *argv[]) {
 
 
     printf("samples:\n");
-    SampleNames(model, grad_state, 10);
+    SampleNames(model, grad_state, 20);
 
     #if 0
     f64 logits[4] = {-0.02, -0.01, 0.01, 0.02};
