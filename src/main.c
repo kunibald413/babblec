@@ -134,10 +134,10 @@ Vector* VectorCreate(MemoryArena* a, int length) {
 
 MLP* MLP_Create(MemoryArena* a, int vocab_size, int context_length, int n_embed, int hidden_dim) {
     MLP* mlp = ArenaPush(a, sizeof(MLP));
-    mlp->E = MatrixCreate(a, vocab_size, n_embed, 0.1);
-    mlp->W1 = MatrixCreate(a, hidden_dim, n_embed * context_length, 0.1);
+    mlp->E = MatrixCreate(a, vocab_size, n_embed, 0.01);
+    mlp->W1 = MatrixCreate(a, hidden_dim, n_embed * context_length, sqrt(6.0 / (f64)n_embed * context_length));
     mlp->b1 = VectorCreate(a, hidden_dim);
-    mlp->W2 = MatrixCreate(a, vocab_size, hidden_dim, 0.1);
+    mlp->W2 = MatrixCreate(a, vocab_size, hidden_dim, 0.01);
     mlp->b2 = VectorCreate(a, vocab_size);
     return mlp;
 }
