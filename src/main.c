@@ -88,6 +88,7 @@ typedef struct MLP {
     Vector* b1;
     Matrix* W2;
     Vector* b2;
+    int ContextLength;
 } MLP;
 
 
@@ -161,6 +162,7 @@ MLP* MLP_Create(MemoryArena* a, int vocab_size, int context_length, int n_embed,
     mlp->b1 = VectorCreate(a, hidden_dim);
     mlp->W2 = MatrixCreate(a, vocab_size, hidden_dim, 0.01);
     mlp->b2 = VectorCreate(a, vocab_size);
+    mlp->ContextLength = context_length;
     return mlp;
 }
 
@@ -172,20 +174,27 @@ GradState* GradStateCreate(MemoryArena* a, MLP* model) {
     s->Grad_W2 = MatrixCreate(a, model->W2->Rows, model->W2->Cols, 0.0);
     s->Grad_b2 = VectorCreate(a, model->b2->Length);
 
-    s->X_embed = VectorCreate(a, model->E->Cols);
+    s->X_embed = VectorCreate(a, model->E->Cols * model->ContextLength);
     s->X_hidden = VectorCreate(a, model->W1->Rows);
     s->A = VectorCreate(a, s->X_hidden->Length);
     s->Probs = VectorCreate(a, model->W2->Rows);
     return s;
 }
 
-f64 MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state, ActivationStats* act_stats) {
-    assert(token_idx >= 0 && token_idx < m->E->Rows && "invalid index");
+f64 MLP_Forward(MLP *m, const int* token_ids, int y, GradState* grad_state, ActivationStats* act_stats) {
+    //assert(token_idx >= 0 && token_idx < m->E->Rows && "invalid index");
 
     // embed
     f64* x_embed = grad_state->X_embed->Data;
-    for (int c = 0; c < m->E->Cols; c++)  {
+    int n_embed = m->E->Cols;
+/*     for (int c = 0; c < m->E->Cols; c++)  {
         x_embed[c] = m->E->Data[token_idx * m->E->Cols + c];
+    } */
+    for (int t = 0; t < m->ContextLength; t++) {
+        int tkn = token_ids[t];
+        for (int c = 0; c < n_embed; c++) {
+            x_embed[t * n_embed + c] = m->E->Data[tkn * n_embed + c];
+        }
     }
 
     // linear 1
@@ -245,7 +254,7 @@ f64 MLP_Forward(MLP *m, int token_idx, int y, GradState* grad_state, ActivationS
     return loss;
 }
 
-void MLP_Backward(MLP* model, int token_id, int y, GradState* grad_state) {
+void MLP_Backward(MLP* model, const int* token_ids, int y, GradState* grad_state) {
 
     // token_idx => E -> x_embed => W1(x_embed) + b1 -> x_hidden => Relu(x_hidden) -> a => W2(a) + b2 -> logits => softmax(logits) -> probs
 
@@ -335,7 +344,7 @@ void MLP_Backward(MLP* model, int token_id, int y, GradState* grad_state) {
     }
 
     // dLdembed (input of linear)
-    f64 dLdembed[model->E->Cols]; // (n_embed, )
+    f64 dLdembed[model->W1->Cols]; // (n_embed * ctx_len, )
     for (int c = 0; c < model->W1->Cols; c++) {
         f64 sum = 0.0;
         for (int r = 0; r < model->W1->Rows; r ++) {
@@ -347,9 +356,13 @@ void MLP_Backward(MLP* model, int token_id, int y, GradState* grad_state) {
     // gradients flow from the input to W1 backwards to embedding, so embedgrad <- xembedgrad
     // xembed is of shape (n_embed, ) so only n_embed elemnts in the embedding layer
     // receive the gradients, precisely the ones for the row that is mapped to the token idx
-    assert(token_id < model->E->Rows && token_id >= 0 && "token id out of bounds");
-    for (int c = 0; c < model->E->Cols; c++) {
-        grad_state->Grad_E->Data[token_id * model->E->Cols + c] = dLdembed[c];
+    // assert(token_id < model->E->Rows && token_id >= 0 && "token id out of bounds");
+    int n_embed = model->E->Cols;
+    for (int t = 0; t < model->ContextLength; t++) {
+        int token_id = token_ids[t];
+        for (int c = 0; c < n_embed; c++) {
+            grad_state->Grad_E->Data[token_id * n_embed + c] += dLdembed[t * n_embed + c]; // aggregate grads
+        }
     }
 }
 
@@ -476,10 +489,14 @@ char* GetTestSample(Dataset* ds, Split* split, int i) {
     return DatasetGetStr(ds, split->TestIndicies[i]);
 }
 
-#define VOCAB_SIZE 27
+#define VOCAB_SIZE 28
+#define TKN_BLANK (VOCAB_SIZE - 1)
+#define USED_TOKENS (VOCAB_SIZE - 1)
+#define CTX_LEN 5
+
 
 byte stoi[256];
-char itos[VOCAB_SIZE];
+char itos[USED_TOKENS];
 const byte EOS = '.';
 
 static void BuildVocab(Dataset* ds) {
@@ -494,43 +511,71 @@ static void BuildVocab(Dataset* ds) {
     }
 }
 
+static inline int PaddedAt(const char* sample, int sample_len, int pos) {
+    if (pos < 0) return TKN_BLANK;
+    if (pos == 0) return stoi[(byte)EOS]; // begin
+    if (pos == sample_len + 1) return stoi[(byte)EOS]; // end
+    return stoi[(byte)sample[pos - 1]];
+}
 
-f64 EvalLoss(
-    MLP* model, GradState* gs,
-    Dataset* ds, Split* split,
-    int* indices, int count) {
+
+f64 EvalLoss(MLP* model, GradState* gs, Dataset* ds, int* indices, int count) {
     f64 total = 0.0;
     int tokens = 0;
+    int context[CTX_LEN];
     for (int w = 0; w < count; w++) {
         const char* word = DatasetGetStr(ds, indices[w]);
         int len = (int)strlen(word);
         for (int i = 0; i <= len; i++) {
-            byte xc = (i == 0)   ? EOS : (byte)word[i - 1];
-            byte yc = (i == len) ? EOS : (byte)word[i];
-            total += MLP_Forward(model, stoi[xc], stoi[yc], gs, NULL);
+            int y = (i == len) ? stoi[(byte)EOS] : stoi[(byte)word[i]];
+            for (int k = 0; k < CTX_LEN; k++) {
+                int pos = i - (CTX_LEN - 1 - k);
+                context[k] = PaddedAt(word, len, pos);
+            }
+            total += MLP_Forward(model, context, y, gs, NULL);
             tokens++;
         }
     }
     return total / (f64)tokens;
 }
 
-void SampleNames(MLP* model, GradState* gs, int n) {
-    int unused_y = 0;
-    for (int k = 0; k < n; k++) {
-        int tok = stoi[EOS];
-        printf("  ");
-        for (int i = 0; i < 30; i++) {
-            MLP_Forward(model, tok, unused_y, gs, NULL);
-            f64 r = RndF64();
-            f64 cdf = 0.0;
-            int next = 0;
-            for (int j = 0; j < VOCAB_SIZE; j++) {
-                cdf += gs->Probs->Data[j];
-                if (r <= cdf) { next = j; break; }
+void SampleNames(MLP* model, GradState* gs, int num_samples) {
+    int context[CTX_LEN];
+    int null_y = 0;
+
+    for (int k = 0; k < num_samples; k++) {
+        int sampled_tokens[128];
+        int seq_len = 1;
+
+        sampled_tokens[0] = stoi[(byte)EOS]; // start with EOS token
+
+        for (int step = 0; step < 30; step++) {
+            for (int t = 0; t < CTX_LEN; t++) {
+                int pos = seq_len - 1 - (CTX_LEN - 1 - t);
+                context[t] = (pos < 0) ? TKN_BLANK : sampled_tokens[pos];
             }
-            if (next == stoi[EOS]) break;
-            putchar(itos[next]);
-            tok = next;
+
+            MLP_Forward(model, context, null_y, gs, NULL);
+
+            // the softmax includes BLANK
+            // we never use BLANK as y, never train on it
+            // exclude it from the prob distri by scaling the roll
+            f64 total = 0.0;
+            for (int j = 0; j < USED_TOKENS; j++) total += gs->Probs->Data[j];
+
+            f64 roll = RndF64() * total; // roll random point on slider [0..total]
+            f64 running_total = 0.0; // how filled the slider is
+            int next_tkn = 0;
+            for (int j = 0; j < USED_TOKENS; j++) {
+                running_total += gs->Probs->Data[j]; // fill slider...
+                if (roll <= running_total) {  // ...till we capture our random point
+                    next_tkn = j; 
+                    break; 
+                }
+            }
+            if (next_tkn == stoi[(byte)EOS]) break;
+            putchar(itos[next_tkn]);
+            sampled_tokens[seq_len++] = next_tkn;
         }
         putchar('\n');
     }
@@ -543,6 +588,37 @@ int main(int argc, char *argv[]) {
     ArenaLog(main_arena);
 
     /* 
+
+    train: steps=320000 lr=0.001 vocab=28 hidden=64 n_embed=16 seq_len=5
+    final train loss: 2.0586
+    final test  loss: 2.0824
+    samples:
+        xiangrayalin
+        avuma
+        wayler
+        malann
+        isabellu
+        jari
+        adija
+        kadeem
+        kennel
+        aayssa
+
+    train: steps=320000 lr=0.001 vocab=28 hidden=64 n_embed=16 seq_len=3
+    final train loss: 2.1371
+    final test  loss: 2.1652
+    samples:
+        jayi
+        limenik
+        abrie
+        josa
+        rus
+        kayla
+        ara
+        elosi
+        cen
+        neioro
+
     
     train: steps=320000 lr=0.020 vocab=27 hidden=64 n_embed=16 seq_len=1
     final train loss: 2.4691
@@ -560,11 +636,11 @@ int main(int argc, char *argv[]) {
         rryra
     */
 
-    f64 lr = 0.01;
-    const int vocab_size = 27;
+    f64 lr = 0.02;
+    const int vocab_size = VOCAB_SIZE;
     const int hidden_dim = 64;
     const int n_embed    = 16;
-    const int seq_len    =  1; 
+    const int seq_len =  CTX_LEN; 
     f64 expected_loss = -log(1/(f64)vocab_size);
     MLP* model = MLP_Create(main_arena, vocab_size, seq_len, n_embed, hidden_dim);
     ArenaLog(main_arena);
@@ -595,6 +671,7 @@ int main(int argc, char *argv[]) {
     
     const int max_train_steps = 320000;
 
+    int context[CTX_LEN];
     for (int step = 0; step < max_train_steps; step++) {
         //const char* s = DatasetGetStr(ds, step % ds->StringsCount);
         // printf("step %d picked sample: %s len: %d\n", step, sample, sample_len);
@@ -605,20 +682,27 @@ int main(int argc, char *argv[]) {
 
         // '.emma.'
         for (int i = 0; i <= sample_len; i ++) {
-            byte x_char = i == 0 ? EOS : (byte)sample[i - 1];
-            byte y_char = i == sample_len ? EOS : (byte)sample[i];
+            // . -> blank blank .
+            // y = e
+            // e -> blank . e
+            // y = m
+            // m -> . e m
+            // y = m
+            int y = (i == sample_len) ? stoi[(byte)EOS]
+                                    : stoi[(byte)sample[i]];
 
-            int token_id = stoi[x_char];
-            int y = stoi[y_char];
+            for (int t = 0; t < CTX_LEN; t++) {
+                int pos = i - (CTX_LEN - 1 - t);
+                context[t] = PaddedAt(sample, sample_len, pos);
+            }
 
-            f64 loss = MLP_Forward(model, token_id, y, grad_state, &act_stats);
+            f64 loss = MLP_Forward(model, context, y, grad_state, &act_stats);
 
             if (step < 20 || step % 1000 == 0 || step == max_train_steps -1) {
-                printf("step: %d x: '%c' y: '%c' loss: %.3f\n",
-                     step, (char)x_char, (char)y_char, loss);
+                printf("step: %d loss: %.3f\n", step, loss);
             }
     
-            MLP_Backward(model, token_id, y, grad_state);
+            MLP_Backward(model, context, y, grad_state);
     
             // gd
             for (int mi = 0; mi < NUM_W; mi ++){
@@ -643,23 +727,21 @@ int main(int argc, char *argv[]) {
     }
     
     ArenaLog(main_arena);
+    PrintActivationStats(&act_stats);
     
     printf("expected rnd init loss: %.4f\n", expected_loss);
     printf("size of MLP: %zu\n", sizeof(MLP));
 
     printf("train: steps=%d lr=%.3f vocab=%d hidden=%d n_embed=%d seq_len=%d\n",
        max_train_steps, lr, vocab_size, hidden_dim, n_embed, seq_len);
-    f64 train_loss = EvalLoss(model, grad_state, ds, &split,
-                          split.TrainIndices, split.TrainCount);
-    f64 test_loss  = EvalLoss(model, grad_state, ds, &split,
-                            split.TestIndicies, split.TestCount);
+    f64 train_loss = EvalLoss(model, grad_state, ds, split.TrainIndices, split.TrainCount);
+    f64 test_loss  = EvalLoss(model, grad_state, ds, split.TestIndicies, split.TestCount);
     printf("final train loss: %.4f\n", train_loss);
     printf("final test  loss: %.4f\n", test_loss);
 
-    PrintActivationStats(&act_stats);
 
     printf("samples:\n");
-    SampleNames(model, grad_state, 20);
+    SampleNames(model, grad_state, 10);
 
     #if 0
     f64 logits[4] = {-0.02, -0.01, 0.01, 0.02};
